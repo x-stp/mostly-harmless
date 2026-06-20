@@ -156,6 +156,7 @@ func handler() http.Handler {
 	filippoIOModules := map[string]bool{
 		"age":             true,
 		"bigmod":          true,
+		"chunked":         true,
 		"cpace":           true,
 		"csrf":            true,
 		"edwards25519":    true,
