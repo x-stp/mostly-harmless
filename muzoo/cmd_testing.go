@@ -214,15 +214,38 @@ func cmdTest(mutDir, relDir string, args []string) error {
 	)
 
 	var runningMu sync.Mutex
-	running := make(map[string]struct{})
+	running := make(map[string]time.Time)
 	updateBarDesc := func() {
 		var names []string
 		for n := range running {
 			names = append(names, n)
 		}
 		sort.Strings(names)
+		for i, n := range names {
+			if d := time.Since(running[n]); d > 10*time.Second {
+				names[i] = fmt.Sprintf("%s (%ds)", n, int(d.Seconds()))
+			}
+		}
 		bar.Describe("testing " + strings.Join(names, ", "))
 	}
+
+	// Refresh the bar every second so per-mutation elapsed times and the
+	// overall timer keep moving while slow mutations run.
+	tickDone := make(chan struct{})
+	go func() {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-tickDone:
+				return
+			case <-t.C:
+				runningMu.Lock()
+				updateBarDesc()
+				runningMu.Unlock()
+			}
+		}
+	}()
 
 	for i, info := range infos {
 		wg.Add(1)
@@ -240,7 +263,7 @@ func cmdTest(mutDir, relDir string, args []string) error {
 			defer func() { sem <- worker }()
 
 			runningMu.Lock()
-			running[num] = struct{}{}
+			running[num] = time.Now()
 			updateBarDesc()
 			runningMu.Unlock()
 			defer func() {
@@ -341,6 +364,7 @@ func cmdTest(mutDir, relDir string, args []string) error {
 	}
 
 	wg.Wait()
+	close(tickDone)
 
 	signal.Stop(sigCh)
 
