@@ -143,6 +143,7 @@ func handler() http.Handler {
 	mux.Handle("mta-sts.bip.filippo.io/.well-known/mta-sts.txt", MTASTSHandler())
 	mux.Handle("mta-sts.ml.filippo.io/.well-known/mta-sts.txt", MTASTSHandler())
 	mux.Handle("mta-sts.geomys.org/.well-known/mta-sts.txt", MTASTSHandler())
+	mux.Handle("mta-sts.geomys.it/.well-known/mta-sts.txt", MTASTSHandler())
 
 	plausible := HostReverseProxyHandler("plausible.io")
 	mux.Handle("filippo.io/js/script.js", plausible)
