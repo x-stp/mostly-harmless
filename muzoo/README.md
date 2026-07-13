@@ -57,7 +57,14 @@ that survive (tests still pass) indicate gaps in test coverage.
 muzoo test
 muzoo test -- uv run pytest -x
 muzoo test -j 4 --timeout 30s -- make test
+muzoo test --memory 2GiB -- go test ./...
 ```
+
+A mutation can send tests into a runaway allocation (e.g. an infinite loop that
+keeps appending to a buffer) that exhausts memory faster than any `--timeout`
+would fire. `--memory` caps the resident memory of each test invocation's
+process group; a mutation that exceeds it is killed (counted as `OOM`, a good
+result) instead of taking down the machine.
 
 With no test command, `muzoo test` defaults to `go test -short ./... && go test
 ./...` — running short tests first, then full tests if needed — and prints the

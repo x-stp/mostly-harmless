@@ -89,13 +89,18 @@ conflicts. Flags unresolved patches as `CONFLICT`. Detects mutations lost during
 rebase (`LOST`). Already applied patches are flagged as `APPLIED` errors (should
 be removed with `muzoo rm`).
 
-### `test [-j <jobs>] [--timeout <duration>] [--] [test-command...]`
+### `test [-j <jobs>] [--timeout <duration>] [--memory <size>] [--] [test-command...]`
 
 Runs test command against each mutation in parallel worktrees. Pre-checks all
 patches apply cleanly (exits 2 if not). Results: `KILLED` (test failed, good),
-`SURVIVED` (test passed, bad), `ERROR` (worktree/apply error). Shows captured
+`SURVIVED` (test passed, bad), `TIMEOUT`/`OOM` (killed by the time or memory
+limit, good), `ERROR` (worktree/apply error). Shows captured
 stdout/stderr for errored mutations. Timeout expiry counts as
-killed. Default `-j` is number of CPUs. Signal handling cleans up worktrees on
+killed. `--memory` (e.g. `2GiB`) caps each invocation's process-group resident
+memory by polling `ps`; exceeding it counts as killed, guarding against
+runaway-allocation mutations that a timeout can't stop before the machine runs
+out of RAM. If the un-mutated baseline exceeds the limit, `test` exits 2.
+Default `-j` is number of CPUs. Signal handling cleans up worktrees on
 SIGINT/SIGTERM. With no test command, defaults to
 `go test -json -failfast -short ./... && go test -json -failfast ./...` and prints the failed
 test(s) next to each killed mutation. When the test command is `pytest` or

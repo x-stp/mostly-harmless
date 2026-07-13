@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -26,11 +27,17 @@ func cmdTest(mutDir, relDir string, args []string) error {
 	f := flag.NewFlagSet("muzoo test", flag.ContinueOnError)
 	jobs := f.Int("j", runtime.NumCPU(), "number of parallel jobs")
 	timeout := f.Duration("timeout", 0, "timeout per test invocation")
+	memory := f.String("memory", "", "memory limit per test invocation (e.g. 2GiB); mutations exceeding it are killed")
 	verbose := f.Bool("v", false, "show output for killed mutations")
 	if err := f.Parse(args); err != nil {
 		return err
 	}
 	testCmd := f.Args()
+
+	memLimit, err := parseSize(*memory)
+	if err != nil {
+		return fmt.Errorf("invalid -memory value: %w", err)
+	}
 
 	defaultGoTest := len(testCmd) == 0
 	if defaultGoTest {
@@ -133,7 +140,12 @@ func cmdTest(mutDir, relDir string, args []string) error {
 		var outBuf bytes.Buffer
 		sanityCmd.Stdout = &outBuf
 		sanityCmd.Stderr = &outBuf
-		if err := sanityCmd.Run(); err != nil {
+		oom, err := runCapped(sanityCmd, memLimit)
+		if oom {
+			return &exitError{code: 2, msg: fmt.Sprintf(
+				"baseline tests exceeded the %s memory limit; raise or unset -memory", *memory)}
+		}
+		if err != nil {
 			if ctx.Err() != nil {
 				return &exitError{code: 2, msg: "interrupted"}
 			}
@@ -172,6 +184,7 @@ func cmdTest(mutDir, relDir string, args []string) error {
 		survived    bool
 		errored     bool
 		timedOut    bool
+		oomKilled   bool
 		output      string
 		killedTests string
 	}
@@ -281,7 +294,7 @@ func cmdTest(mutDir, relDir string, args []string) error {
 			cmd.Stdout = &outBuf
 			cmd.Stderr = &outBuf
 
-			err := cmd.Run()
+			oom, err := runCapped(cmd, memLimit)
 			output := outBuf.String()
 			if defaultGoTest {
 				output = formatGoTestOutput(output)
@@ -298,6 +311,10 @@ func cmdTest(mutDir, relDir string, args []string) error {
 			} else if cmdCtx.Err() == context.DeadlineExceeded {
 				// Timeout expired = mutation killed (GOOD).
 				results[idx].timedOut = true
+				results[idx].output = output
+			} else if oom {
+				// Exceeded the memory limit = mutation killed (GOOD).
+				results[idx].oomKilled = true
 				results[idx].output = output
 			} else {
 				var exitErr *exec.ExitError
@@ -348,6 +365,9 @@ func cmdTest(mutDir, relDir string, args []string) error {
 			survivedCount++
 		case r.timedOut:
 			fmt.Printf("%s  %s   %s\n", num, colorize(tty, "TIMEOUT", colorGreen), r.desc)
+			killed++
+		case r.oomKilled:
+			fmt.Printf("%s  %s       %s\n", num, colorize(tty, "OOM", colorGreen), r.desc)
 			killed++
 		default:
 			killedTests := colorize(tty, r.killedTests, colorDim)
@@ -501,4 +521,98 @@ func parsePytestFailedTests(output string) []string {
 // just return it as-is.
 func formatPytestOutput(output string) string {
 	return output
+}
+
+// parseSize parses a human-readable byte size like "2GiB", "512m", or a bare
+// byte count. An empty string (or "0") returns 0, meaning no limit. Units are
+// powers of 1024; a trailing "b"/"ib" is optional and ignored.
+func parseSize(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "0" {
+		return 0, nil
+	}
+	i := 0
+	for i < len(s) && (s[i] == '.' || (s[i] >= '0' && s[i] <= '9')) {
+		i++
+	}
+	num, err := strconv.ParseFloat(s[:i], 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size %q", s)
+	}
+	unit := strings.ToLower(strings.TrimSpace(s[i:]))
+	unit = strings.TrimSuffix(unit, "b")
+	unit = strings.TrimSuffix(unit, "i")
+	var mult int64
+	switch unit {
+	case "":
+		mult = 1
+	case "k":
+		mult = 1 << 10
+	case "m":
+		mult = 1 << 20
+	case "g":
+		mult = 1 << 30
+	case "t":
+		mult = 1 << 40
+	default:
+		return 0, fmt.Errorf("invalid size unit in %q", s)
+	}
+	return int64(num * float64(mult)), nil
+}
+
+// runCapped runs cmd like cmd.Run, but if memLimit is positive it periodically
+// samples the resident memory of cmd's process group and, when the total
+// exceeds memLimit, kills the group and reports oom=true. It relies on the
+// caller having set SysProcAttr.Setpgid, so cmd.Process.Pid is the group ID.
+func runCapped(cmd *exec.Cmd, memLimit int64) (oom bool, err error) {
+	if memLimit <= 0 {
+		return false, cmd.Run()
+	}
+	if err := cmd.Start(); err != nil {
+		return false, err
+	}
+	var killed atomic.Bool
+	done := make(chan struct{})
+	go func() {
+		t := time.NewTicker(250 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				if processGroupRSS(cmd.Process.Pid) > memLimit {
+					killed.Store(true)
+					syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+					return
+				}
+			}
+		}
+	}()
+	err = cmd.Wait()
+	close(done)
+	return killed.Load(), err
+}
+
+// processGroupRSS returns the total resident set size in bytes of all
+// processes in the given process group, or 0 if it cannot be determined.
+func processGroupRSS(pgid int) int64 {
+	out, err := exec.Command("ps", "-A", "-o", "pgid=,rss=").Output()
+	if err != nil {
+		return 0
+	}
+	var total int64
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		pg, err1 := strconv.Atoi(fields[0])
+		rssKB, err2 := strconv.Atoi(fields[1])
+		if err1 != nil || err2 != nil || pg != pgid {
+			continue
+		}
+		total += int64(rssKB) * 1024
+	}
+	return total
 }
