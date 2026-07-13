@@ -76,7 +76,7 @@ func cmdRebase(repoRoot, mutDir string, args []string) error {
 			continue
 		}
 
-		newDiff, method, err := rebaseInWorktree(wtRoot, num, diff, desc, hasMergiraf, claudePath)
+		newDiff, method, err := rebaseInWorktree(repoRoot, wtRoot, num, diff, desc, hasMergiraf, claudePath)
 		if err != nil {
 			fmt.Printf("%s  CONFLICT  %s (could not rebase automatically)\n", num, descriptionLabel(desc))
 			anyFailed = true
@@ -104,7 +104,7 @@ func cmdRebase(repoRoot, mutDir string, args []string) error {
 // cascading through strategies: three-way merge, then mergiraf per-file
 // (keeping partial successes), then LLM for any remaining failed files.
 // Returns (newDiff, method, error).
-func rebaseInWorktree(wtRoot, num, diff, desc string, hasMergiraf bool, claudePath string) (string, string, error) {
+func rebaseInWorktree(repoRoot, wtRoot, num, diff, desc string, hasMergiraf bool, claudePath string) (string, string, error) {
 	wtPath := worktreeDir(wtRoot, "rebase-"+num)
 	if err := createWorktree(wtPath); err != nil {
 		return "", "", err
@@ -143,7 +143,7 @@ func rebaseInWorktree(wtRoot, num, diff, desc string, hasMergiraf bool, claudePa
 	usedMergiraf := false
 	if hasMergiraf {
 		for i, f := range files {
-			if err := mergirafFile(wtPath, f); err == nil {
+			if err := mergirafFile(repoRoot, wtPath, f); err == nil {
 				delete(remaining, i)
 				usedMergiraf = true
 			} else {
@@ -195,14 +195,10 @@ func rebaseInWorktree(wtRoot, num, diff, desc string, hasMergiraf bool, claudePa
 
 // mergirafFile tries to resolve a single file's conflict using mergiraf.
 // It modifies the file in the worktree in place on success.
-func mergirafFile(wtPath string, f diffFile) error {
-	if f.oldBlob == "" || strings.TrimLeft(f.oldBlob, "0") == "" {
-		return fmt.Errorf("no old blob for %s (new file)", f.path)
-	}
-
-	baseContent, err := gitCatFile(f.oldBlob)
-	if err != nil {
-		return fmt.Errorf("getting base content for %s: %w", f.path, err)
+func mergirafFile(repoRoot, wtPath string, f diffFile) error {
+	baseContent, ok := findBaseContent(repoRoot, f)
+	if !ok {
+		return fmt.Errorf("no base version of %s found that the mutation applies to", f.path)
 	}
 
 	headPath := filepath.Join(wtPath, f.path)
@@ -216,6 +212,13 @@ func mergirafFile(wtPath string, f diffFile) error {
 		return err
 	}
 	defer os.RemoveAll(tmpDir)
+
+	// On macOS $TMPDIR lives under /var, a symlink to /private/var. "git apply"
+	// refuses to touch files whose path traverses a symlink ("beyond a symbolic
+	// link"), so canonicalize the temp dir before handing paths to git.
+	if resolved, err := filepath.EvalSymlinks(tmpDir); err == nil {
+		tmpDir = resolved
+	}
 
 	basePath := filepath.Join(tmpDir, "base")
 	mutatedPath := filepath.Join(tmpDir, "mutated")
@@ -241,7 +244,9 @@ func mergirafFile(wtPath string, f diffFile) error {
 		return err
 	}
 
-	mgCmd := exec.Command("mergiraf", "merge", basePath, headFilePath, mutatedPath, "-o", resolvedPath)
+	// Pass -p so mergiraf detects the language from the real file extension and
+	// does a structured (AST-aware) merge; the temp files are extension-less.
+	mgCmd := exec.Command("mergiraf", "merge", basePath, headFilePath, mutatedPath, "-o", resolvedPath, "-p", f.path)
 	if out, err := mgCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("mergiraf failed for %s: %w\n%s", f.path, err, out)
 	}
@@ -374,6 +379,59 @@ func rewriteDiffPaths(diff, newName string) string {
 		result.WriteString(line)
 	}
 	return result.String()
+}
+
+// findBaseContent returns the content of a version of f.path that the mutation
+// patch applies to, to serve as the base for the three-way merge. It tries the
+// blob recorded in the patch's index line first, then falls back to searching
+// the file's history for the most recent version the patch still applies to.
+// This keeps rebasing robust when a patch's recorded base blob has gone stale,
+// e.g. the surrounding code was refactored after the mutation was captured.
+func findBaseContent(repoRoot string, f diffFile) ([]byte, bool) {
+	if f.oldBlob != "" && strings.TrimLeft(f.oldBlob, "0") != "" {
+		if content, err := gitCatFile(f.oldBlob); err == nil && patchApplies(content, f.diff) {
+			return content, true
+		}
+	}
+	out, err := gitOutput("-C", repoRoot, "log", "--format=%H", "--", f.path)
+	if err != nil {
+		return nil, false
+	}
+	for _, commit := range strings.Fields(out) {
+		blob, err := gitOutput("-C", repoRoot, "rev-parse", commit+":"+f.path)
+		if err != nil {
+			continue
+		}
+		content, err := gitCatFile(blob)
+		if err != nil {
+			continue
+		}
+		if patchApplies(content, f.diff) {
+			return content, true
+		}
+	}
+	return nil, false
+}
+
+// patchApplies reports whether a single file's diff applies cleanly to content.
+func patchApplies(content []byte, fileDiff string) bool {
+	tmpDir, err := os.MkdirTemp("", "muzoo-base-*")
+	if err != nil {
+		return false
+	}
+	defer os.RemoveAll(tmpDir)
+	// See mergirafFile: canonicalize the temp dir so "git apply" doesn't refuse
+	// paths that traverse a symlink (macOS $TMPDIR lives under /var).
+	if resolved, err := filepath.EvalSymlinks(tmpDir); err == nil {
+		tmpDir = resolved
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "f"), content, 0o644); err != nil {
+		return false
+	}
+	cmd := exec.Command("git", "apply", "--check", "--unsafe-paths", "--directory="+tmpDir)
+	cmd.Stdin = strings.NewReader(rewriteDiffPaths(fileDiff, "f"))
+	cmd.Dir = tmpDir
+	return cmd.Run() == nil
 }
 
 func hasMergirafBinary() bool {
